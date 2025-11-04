@@ -308,30 +308,30 @@ impl LsmStorageInner {
     }
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        // Check current memtable first
         let state = self.state.read();
-        if let Some(val) = state.memtable.get(_key) {
-            // Key found in current memtable
-            if val == Bytes::from_static(b"") {
-                return Ok(None); // Delete marker
-            } else {
-                return Ok(Some(val));
-            }
-        }
 
-        // Check immutable memtables (from latest to earliest)
-        // If key is found in any memtable (even as a delete), return immediately
-        for memtable in state.imm_memtables.iter() {
-            if let Some(val) = memtable.get(_key) {
-                // Key found - return immediately (don't check older memtables)
-                if val == Bytes::from_static(b"") {
-                    return Ok(None); // Delete marker
-                } else {
-                    return Ok(Some(val));
-                }
+        // Helper closure to process found values, handling delete markers
+        let process_value = |val: Bytes| {
+            if val == Bytes::from_static(b"") {
+                None
+            } else {
+                Some(val)
             }
-        }
-        Ok(None)
+        };
+
+        // Search the current memtable, then immutables in order
+        state
+            .memtable
+            .get(_key)
+            .map(&process_value)
+            .or_else(|| {
+                state
+                    .imm_memtables
+                    .iter()
+                    .find_map(|memtable| memtable.get(_key).map(&process_value))
+            })
+            .flatten()
+            .map_or(Ok(None), |val| Ok(Some(val)))
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
