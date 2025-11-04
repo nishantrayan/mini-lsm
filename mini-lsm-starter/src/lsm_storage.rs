@@ -308,14 +308,27 @@ impl LsmStorageInner {
     }
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        let val1 = self.get_from_memtable(_key, &self.state.read().memtable)?;
-        if val1.is_some() {
-            return Ok(val1);
+        // Check current memtable first
+        let state = self.state.read();
+        if let Some(val) = state.memtable.get(_key) {
+            // Key found in current memtable
+            if val == Bytes::from_static(b"") {
+                return Ok(None); // Delete marker
+            } else {
+                return Ok(Some(val));
+            }
         }
-        for memtable in self.state.read().imm_memtables.iter() {
-            let val = self.get_from_memtable(_key, memtable)?;
-            if val.is_some() {
-                return Ok(val);
+
+        // Check immutable memtables (from latest to earliest)
+        // If key is found in any memtable (even as a delete), return immediately
+        for memtable in state.imm_memtables.iter() {
+            if let Some(val) = memtable.get(_key) {
+                // Key found - return immediately (don't check older memtables)
+                if val == Bytes::from_static(b"") {
+                    return Ok(None); // Delete marker
+                } else {
+                    return Ok(Some(val));
+                }
             }
         }
         Ok(None)
@@ -327,14 +340,48 @@ impl LsmStorageInner {
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
+    ///
+    /// If the key already exists in the current memtable, it will be overwritten.
+    /// If the key exists in an immutable memtable, the new value in the mutable memtable
+    /// will shadow it during reads (since we check mutable memtable first).
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        let expected_size_increase = _key.len() + _value.len();
         let state_lock = self.state_lock.lock();
-        let current_size = self.state.read().memtable.approximate_size();
-        if current_size + expected_size_increase > self.options.target_sst_size {
+
+        // Check if key already exists in current memtable to calculate accurate size
+        let (size_change, needs_freeze) = {
+            let state = self.state.read();
+            let existing_value = state.memtable.get(_key);
+            let old_value_size = existing_value.as_ref().map(|v| v.len()).unwrap_or(0);
+            let new_value_size = _value.len();
+            let key_size = _key.len();
+
+            // Calculate size change: if key exists, we subtract old value size, then add new
+            let size_change = if existing_value.is_some() {
+                // Key exists: subtract old value, add new value (key size cancels out)
+                new_value_size.saturating_sub(old_value_size)
+            } else {
+                // New key: add both key and value
+                key_size + new_value_size
+            };
+
+            let current_size = state.memtable.approximate_size();
+            let needs_freeze = current_size + size_change > self.options.target_sst_size;
+            (size_change, needs_freeze)
+        };
+
+        if needs_freeze {
             self.force_freeze_memtable(&state_lock)?;
         }
-        self.state.write().memtable.put(_key, _value)
+
+        // Put the key-value pair in the current memtable
+        // Get a fresh reference to ensure we're using the current memtable
+        // (which might be a new one if we just froze the previous one)
+        // Note: If key exists in immutable memtables, this new value will shadow it
+        {
+            let state_guard = self.state.write();
+            state_guard.memtable.put(_key, _value)?;
+        }
+        Ok(())
     }
 
     /// Remove a key from the storage by writing an empty value.
