@@ -296,42 +296,13 @@ impl LsmStorageInner {
         compaction_filters.push(compaction_filter);
     }
 
-    pub fn get_from_memtable(&self, _key: &[u8], memtable: &MemTable) -> Result<Option<Bytes>> {
-        let val = memtable.get(_key).map(|value| {
-            if value == Bytes::from_static(b"") {
-                None
-            } else {
-                Some(value)
-            }
-        });
-        Ok(val.unwrap_or(None))
-    }
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        let state = self.state.read();
-
-        // Helper closure to process found values, handling delete markers
-        let process_value = |val: Bytes| {
-            if val == Bytes::from_static(b"") {
-                None
-            } else {
-                Some(val)
-            }
-        };
-
-        // Search the current memtable, then immutables in order
-        state
-            .memtable
-            .get(_key)
-            .map(&process_value)
-            .or_else(|| {
-                state
-                    .imm_memtables
-                    .iter()
-                    .find_map(|memtable| memtable.get(_key).map(&process_value))
-            })
-            .flatten()
-            .map_or(Ok(None), |val| Ok(Some(val)))
+        match self.state.read().memtable.get(_key) {
+            Some(val) if val == Bytes::from_static(&[]) => Ok(None),
+            Some(val) => Ok(Some(val)),
+            None => Ok(None),
+        }
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -345,48 +316,22 @@ impl LsmStorageInner {
     /// If the key exists in an immutable memtable, the new value in the mutable memtable
     /// will shadow it during reads (since we check mutable memtable first).
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        let state_lock = self.state_lock.lock();
-
-        // Check if key already exists in current memtable to calculate accurate size
-        let (size_change, needs_freeze) = {
-            let state = self.state.read();
-            let existing_value = state.memtable.get(_key);
-            let old_value_size = existing_value.as_ref().map(|v| v.len()).unwrap_or(0);
-            let new_value_size = _value.len();
-            let key_size = _key.len();
-
-            // Calculate size change: if key exists, we subtract old value size, then add new
-            let size_change = if existing_value.is_some() {
-                // Key exists: subtract old value, add new value (key size cancels out)
-                new_value_size.saturating_sub(old_value_size)
-            } else {
-                // New key: add both key and value
-                key_size + new_value_size
-            };
-
-            let current_size = state.memtable.approximate_size();
-            let needs_freeze = current_size + size_change > self.options.target_sst_size;
-            (size_change, needs_freeze)
-        };
-
-        if needs_freeze {
-            self.force_freeze_memtable(&state_lock)?;
-        }
-
-        // Put the key-value pair in the current memtable
-        // Get a fresh reference to ensure we're using the current memtable
-        // (which might be a new one if we just froze the previous one)
-        // Note: If key exists in immutable memtables, this new value will shadow it
+        let approximate_size = _key.len() + _value.len();
+        if self.state.read().memtable.approximate_size() + approximate_size
+            > self.options.target_sst_size
         {
-            let state_guard = self.state.write();
-            state_guard.memtable.put(_key, _value)?;
+            let state_lock = self.state_lock.lock();
+            if self.state.read().memtable.approximate_size() >= self.options.target_sst_size {
+                self.force_freeze_memtable(&state_lock)?;
+            }
         }
+        self.state.read().memtable.put(_key, _value)?;
         Ok(())
     }
 
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        self.put(_key, b"")
+        self.put(_key, &Bytes::from_static(&[]))
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
