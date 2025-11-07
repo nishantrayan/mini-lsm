@@ -15,6 +15,7 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -297,12 +298,35 @@ impl LsmStorageInner {
     }
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        match self.state.read().memtable.get(_key) {
-            Some(val) if val == Bytes::from_static(&[]) => Ok(None),
-            Some(val) => Ok(Some(val)),
-            None => Ok(None),
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        let state = self.state.read();
+
+        // Helper closure to check a memtable for the key
+        let check_memtable = |memtable: &Arc<MemTable>| {
+            if let Some(val) = memtable.get(key) {
+                if val != Bytes::from_static(&[]) {
+                    Some(Ok(Some(val)))
+                } else {
+                    Some(Ok(None))
+                }
+            } else {
+                None
+            }
+        };
+
+        // Check current memtable
+        if let Some(result) = check_memtable(&state.memtable) {
+            return result;
         }
+
+        // Check immutable memtables
+        for memtable in &state.imm_memtables {
+            if let Some(result) = check_memtable(memtable) {
+                return result;
+            }
+        }
+
+        Ok(None)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -355,12 +379,13 @@ impl LsmStorageInner {
     }
 
     /// Force freeze the current memtable to an immutable memtable
-    pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        let mut guard = self.state.write();
-        let mut snapshot = guard.as_ref().clone();
-        snapshot.imm_memtables.insert(0, snapshot.memtable.clone());
-        snapshot.memtable = Arc::new(MemTable::create(self.next_sst_id()));
-        *guard = Arc::new(snapshot);
+    pub fn force_freeze_memtable(&self, state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
+        let memtable = MemTable::create(self.next_sst_id());
+        let mut state_guard = self.state.write();
+        let mut snapshot = state_guard.as_ref().clone();
+        snapshot.imm_memtables.insert(0, snapshot.memtable);
+        snapshot.memtable = Arc::new(memtable);
+        *state_guard = Arc::new(snapshot);
         Ok(())
     }
 
