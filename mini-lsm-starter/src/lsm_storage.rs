@@ -300,11 +300,12 @@ impl LsmStorageInner {
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
         let guard = self.state.read();
         let state = guard.clone();
-        let imm_memtables = state.imm_memtables
-            .iter().map(|m| m.clone()).collect();
+        let imm_memtables = state.imm_memtables.iter().map(|m| m.clone()).collect();
         let memtable_bag = vec![vec![state.memtable.clone()], imm_memtables];
-        let all_memtables = memtable_bag.into_iter()
-            .flatten().collect::<Vec<Arc<MemTable>>>();
+        let all_memtables = memtable_bag
+            .into_iter()
+            .flatten()
+            .collect::<Vec<Arc<MemTable>>>();
         for memtable in all_memtables {
             let value = memtable.get(_key);
             if let Some(bytes_value) = value {
@@ -312,7 +313,7 @@ impl LsmStorageInner {
                     Ok(None)
                 } else {
                     Ok(Some(bytes_value.clone()))
-                }
+                };
             }
         }
         Ok(None)
@@ -382,9 +383,7 @@ impl LsmStorageInner {
         let new_state = Arc::new(LsmStorageState {
             memtable: Arc::new(new_memtable),
             imm_memtables: new_imm_memtables,
-            l0_sstables: guard.l0_sstables.clone(),
-            levels: guard.levels.clone(),
-            sstables: guard.sstables.clone(),
+            ..guard.clone().as_ref().clone()
         });
         *guard = new_state;
         Ok(())
